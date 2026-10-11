@@ -1,0 +1,7 @@
+bin/
+obj/
+*.user
+.vs/
+# FFmpeg本体は大きいのでリポジトリに入れない(scripts/prepare-ffmpeg.ps1 で用意する)
+third_party/
+publish/

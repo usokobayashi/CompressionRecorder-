@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
+    <AssemblyName>CompressionRecorder</AssemblyName>
+    <Product>Compression Recorder</Product>
+    <Version>2.0.0</Version>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
+  </PropertyGroup>
+  <ItemGroup Condition="Exists('third_party\ffmpeg.exe.gz')">
+    <EmbeddedResource Include="third_party\ffmpeg.exe.gz" LogicalName="ffmpeg.exe.gz" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="NAudio" Version="2.3.0" />
+  </ItemGroup>
+</Project>

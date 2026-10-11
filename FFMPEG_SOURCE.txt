@@ -1,0 +1,10 @@
+This distribution includes an unmodified FFmpeg 9.0.1 essentials build from gyan.dev.
+
+Binary build:
+https://www.gyan.dev/ffmpeg/builds/
+
+Corresponding FFmpeg source code:
+https://ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz
+
+FFmpeg project:
+https://ffmpeg.org/
