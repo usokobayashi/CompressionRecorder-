@@ -113,6 +113,9 @@ public sealed class MainForm : Form
     private bool stopping;
     private bool playing;
     private bool scrubbing; // 切り取りのつまみを動かしている間(再生を止めて位置を見せる)
+    private double? pendingSeek;          // まだ映像へ反映していない、最新の再生位置の要求(秒)
+    private long lastSeekAt;              // 最後に位置を動かした時刻(TickCount64)。動かした直後は映像の位置が追いつかない
+    private readonly System.Windows.Forms.Timer seekTimer = new() { Interval = 40 };
     private bool recordedWithAudio;
     private ClipFormat outputFormat = ClipFormat.Mp4;
     private bool keptOnTop;              // 録画後の編集画面を、他のアプリの上へ出している間
@@ -218,6 +221,7 @@ public sealed class MainForm : Form
         Controls.AddRange([title, subtitle, setupCard, editorPanel, fileCard]);
         recordTimer.Tick += RecordTimerTick;
         previewTimer.Tick += PreviewTimerTick;
+        seekTimer.Tick += (_, _) => FlushSeek(false);
         estimateTimer.Tick += async (_, _) => { estimateTimer.Stop(); await EstimateOutputAsync(); };
         FormClosing += OnClosing;
         Load += (_, _) => fadeGuardTimer.Start();
@@ -251,7 +255,7 @@ public sealed class MainForm : Form
         resolutionInfo.ForeColor = Theme.Muted; resolutionInfo.Font = Theme.Font(Theme.FontSize.Small); resolutionInfo.AutoEllipsis = true;
         previewHost.Location = new Point(0, 42); previewHost.Size = new Size(506, 285); previewHost.BackColor = Theme.Surface;
         media.LoadedBehavior = MediaState.Manual; media.UnloadedBehavior = MediaState.Manual; media.Stretch = System.Windows.Media.Stretch.Uniform;
-        media.MediaEnded += (_, _) => { if (playing) { media.Position = TimeSpan.FromSeconds(TrimStartSeconds); media.Play(); } };
+        media.MediaEnded += (_, _) => { if (playing && !scrubbing) { SeekTo(TrimStartSeconds, true); media.Play(); } };
         BuildCropOverlay();
         cropInfo.Text = "選択範囲: フレーム全体"; cropInfo.Location = new Point(18, 331); cropInfo.Size = new Size(330, 20); cropInfo.ForeColor = Theme.Muted; cropInfo.Font = Theme.Font(Theme.FontSize.Caption); cropInfo.AutoEllipsis = true;
         cropResetButton.Text = "選択をリセット"; cropResetButton.Location = new Point(368, 327); cropResetButton.Size = new Size(120, 26); cropResetButton.Font = Theme.Font(Theme.FontSize.Caption);
@@ -263,11 +267,16 @@ public sealed class MainForm : Form
         trimSlider.Location = new Point(18, 429); trimSlider.Size = new Size(470, 30);
         trimSlider.RangeChanged += (_, _) => { SyncSeekToTrim(); UpdateTrimInfo(); };
         // つまみを動かしている間は一時停止してその位置を見せ、離したら切り取り範囲の頭から再生を再開する
-        trimSlider.DragPositionChanged += (_, value) => { scrubbing = true; media.Pause(); media.Position = TimeSpan.FromSeconds((double)value); ShowTrimBubble(value); };
+        trimSlider.DragPositionChanged += (_, value) =>
+        {
+            if (!scrubbing) { scrubbing = true; media.Pause(); } // 一時停止は最初の1回だけ
+            SeekTo((double)value, false);
+            ShowTrimBubble(value);
+        };
         trimSlider.DragEnded += (_, _) =>
         {
             trimBubble.Visible = false; scrubbing = false;
-            if (clipLoaded && !exporting) { media.Position = TimeSpan.FromSeconds(TrimStartSeconds); media.Play(); playing = true; previewTimer.Start(); }
+            if (clipLoaded && !exporting) { SeekTo(TrimStartSeconds, true); media.Play(); playing = true; previewTimer.Start(); }
         };
         trimBubble.Visible = false; trimBubble.AutoSize = true; trimBubble.BackColor = Theme.Accent; trimBubble.ForeColor = Theme.TextOnAccent;
         trimBubble.Font = Theme.MonoFont(Theme.FontSize.Caption, FontStyle.Bold); trimBubble.Padding = new Padding(6, 2, 6, 2);
@@ -1040,23 +1049,46 @@ public sealed class MainForm : Form
         UpdateTrimInfo();
     }
 
+    // 再生位置を動かす。つまみを素早く動かすと要求が大量に来るため、最新の1つだけを一定間隔で映像へ反映する。
+    // 動かした直後は映像の位置が追いつかず古い値を返すので、その間は位置の確認をしない(確認すると、戻し直しが重なって小刻みに戻る)。
+    private void SeekTo(double seconds, bool immediate)
+    {
+        pendingSeek = Math.Clamp(seconds, 0, Math.Max(0.1, recordedDuration));
+        if (immediate) FlushSeek(true);
+        else if (!seekTimer.Enabled) seekTimer.Start();
+    }
+
+    private void FlushSeek(bool force)
+    {
+        if (pendingSeek is not double target) { seekTimer.Stop(); return; }
+        if (!force && Environment.TickCount64 - lastSeekAt < 70) return;
+        pendingSeek = null; lastSeekAt = Environment.TickCount64;
+        media.Position = TimeSpan.FromSeconds(target);
+        if (pendingSeek is null) seekTimer.Stop();
+    }
+
+    private bool SeekSettled => pendingSeek is null && Environment.TickCount64 - lastSeekAt > 450;
+
     private void PreviewTimerTick(object? sender, EventArgs e)
     {
         if (!playing || scrubbing) return;
-        if (media.Position.TotalSeconds >= TrimEndSeconds || media.Position.TotalSeconds < TrimStartSeconds)
+        var position = media.Position.TotalSeconds;
+        if (SeekSettled && (position >= TrimEndSeconds - 0.03 || position < TrimStartSeconds - 0.3))
         {
-            media.Position = TimeSpan.FromSeconds(TrimStartSeconds);
+            // 範囲の終わりに来たら頭へ戻して再生を続ける(戻し先へ着くまでは、位置の確認をしない)
+            SeekTo(TrimStartSeconds, true);
             media.Play();
+            position = TrimStartSeconds;
         }
-        previewSeek.Value = Math.Clamp((int)(media.Position.TotalSeconds * 10), previewSeek.Minimum, previewSeek.Maximum);
-        ShowPreviewTime(media.Position.TotalSeconds);
+        position = Math.Clamp(position, TrimStartSeconds, TrimEndSeconds);
+        previewSeek.Value = Math.Clamp((int)Math.Round(position * 10), previewSeek.Minimum, previewSeek.Maximum);
+        ShowPreviewTime(position);
     }
 
     private void SeekChanged(object? sender, EventArgs e)
     {
         var position = Math.Clamp(previewSeek.Value / 10d, TrimStartSeconds, TrimEndSeconds);
-        media.Position = TimeSpan.FromSeconds(position);
-        previewSeek.Value = Math.Clamp((int)(position * 10), previewSeek.Minimum, previewSeek.Maximum);
+        SeekTo(position, false);
         if (!playing) { media.Play(); playing = true; previewTimer.Start(); }
         ShowPreviewTime(position);
     }
@@ -1125,7 +1157,7 @@ public sealed class MainForm : Form
             SetExportBusy(false);
             ApplyExportLook(); exportButton.Invalidate();
             UpdateTrimText(); // 保存後の「現在の解像度」は実際の値のまま残す
-            if (tempPath is not null) { media.Position = TimeSpan.FromSeconds(TrimStartSeconds); media.Play(); playing = true; previewTimer.Start(); }
+            if (tempPath is not null) { SeekTo(TrimStartSeconds, true); media.Play(); playing = true; previewTimer.Start(); }
         }
     }
 
