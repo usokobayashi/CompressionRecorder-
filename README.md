@@ -39,6 +39,12 @@ Windows 10/11 x64 向けです。
 
 <img src="docs/app.png" alt="uskCompressionRecorder の画面" width="430">
 
+### 使用例
+
+Blender の画面を録画したあと、範囲を切り取って保存する前の状態です。
+
+![Blender の画面を録画して編集している様子](docs/usage.webp)
+
 ## ビルド
 
 .NET 10 SDK が必要です。
