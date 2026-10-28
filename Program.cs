@@ -1,4 +1,4 @@
-namespace CompressionRecorder;
+namespace uskCompressionRecorder;
 
 internal static class Program
 {

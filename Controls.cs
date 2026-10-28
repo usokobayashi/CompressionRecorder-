@@ -8,7 +8,7 @@ using System.ComponentModel;
 using System.Drawing.Drawing2D;
 using System.Text.RegularExpressions;
 
-namespace CompressionRecorder;
+namespace uskCompressionRecorder;
 
 //--------------
 // Motion
@@ -179,13 +179,20 @@ internal sealed class ToggleSwitch : CheckBox
 
 //--------------
 // TrimRangeSlider
+// 切り取る時間の範囲。つまみで始点・終点を、つまみの間をドラッグすると長さを保ったまま範囲をずらす。
+// カーソルが近いつまみ・動かしているつまみだけを大きくする。
 //--------------
 internal sealed class TrimRangeSlider : Control
 {
+    private const decimal MinGap = 0.2M;
     private bool draggingStart;
     private bool draggingEnd;
-    private readonly FloatFader hoverFader;
-    private float hover;
+    private bool draggingRange;
+    private decimal rangeGrabOffset; // 範囲をずらすとき、つかんだ位置と始点の差
+    private readonly FloatFader startFader;
+    private readonly FloatFader endFader;
+    private readonly FloatFader rangeFader;
+    private float startEmphasis, endEmphasis, rangeEmphasis; // 0:通常 0.5:カーソルが近い 1:動かしている
 
     public decimal Minimum { get; private set; }
     public decimal Maximum { get; private set; } = 30;
@@ -201,14 +208,34 @@ internal sealed class TrimRangeSlider : Control
         SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor, true);
         Cursor = Cursors.Hand;
         BackColor = Color.Transparent;
-        hoverFader = new FloatFader(v => { hover = v; Invalidate(); });
+        startFader = new FloatFader(v => { startEmphasis = v; Invalidate(); });
+        endFader = new FloatFader(v => { endEmphasis = v; Invalidate(); });
+        rangeFader = new FloatFader(v => { rangeEmphasis = v; Invalidate(); });
     }
 
-    protected override void OnMouseEnter(EventArgs e) { hoverFader.FadeTo(1); base.OnMouseEnter(e); }
-    protected override void OnMouseLeave(EventArgs e) { hoverFader.FadeTo(0); base.OnMouseLeave(e); }
+    protected override void OnMouseLeave(EventArgs e) { if (!draggingStart && !draggingEnd && !draggingRange) UpdateEmphasis(null); base.OnMouseLeave(e); }
+    protected override void OnEnabledChanged(EventArgs e) { UpdateEmphasis(null); base.OnEnabledChanged(e); }
 
     private float Scaled(float value) => value * DeviceDpi / 96f;
     private float HandleRadius => Scaled(Theme.SliderHandleRadius);
+
+    // 押したときに何を動かすか: 近いつまみ、つまみから離れた範囲の内側なら範囲ごと
+    private (bool Start, bool End, bool Range) HitTest(int x)
+    {
+        var startX = ValueToX(StartValue); var endX = ValueToX(EndValue);
+        var inside = x > startX + HandleRadius * 1.5f && x < endX - HandleRadius * 1.5f;
+        if (inside && Maximum - Minimum > EndValue - StartValue) return (false, false, true);
+        return Math.Abs(x - startX) <= Math.Abs(x - endX) ? (true, false, false) : (false, true, false);
+    }
+
+    private void UpdateEmphasis(int? x)
+    {
+        (bool Start, bool End, bool Range) hit = x is int px && Enabled ? HitTest(px) : default;
+        startFader.FadeTo(draggingStart ? 1f : hit.Start ? 0.5f : 0f);
+        endFader.FadeTo(draggingEnd ? 1f : hit.End ? 0.5f : 0f);
+        rangeFader.FadeTo(draggingRange ? 1f : hit.Range ? 0.5f : 0f);
+        Cursor = hit.Range || draggingRange ? Cursors.SizeWE : Cursors.Hand;
+    }
 
     public void SetRange(decimal minimum, decimal maximum, decimal start, decimal end)
     {
@@ -217,6 +244,10 @@ internal sealed class TrimRangeSlider : Control
         EndValue = Math.Clamp(end, Minimum, Maximum);
         Invalidate();
     }
+
+    // 始点・終点だけを変える(範囲の端は変えない)。短すぎる範囲にはしない
+    public void SetStart(decimal value) { StartValue = Math.Clamp(Math.Round(value, 1), Minimum, EndValue - MinGap); Invalidate(); RangeChanged?.Invoke(this, EventArgs.Empty); }
+    public void SetEnd(decimal value) { EndValue = Math.Clamp(Math.Round(value, 1), StartValue + MinGap, Maximum); Invalidate(); RangeChanged?.Invoke(this, EventArgs.Empty); }
 
     public float PositionForValue(decimal value) => ValueToX(value);
 
@@ -238,32 +269,41 @@ internal sealed class TrimRangeSlider : Control
 
     protected override void OnMouseDown(MouseEventArgs e)
     {
-        var startX = ValueToX(StartValue); var endX = ValueToX(EndValue);
-        if (Math.Abs(e.X - startX) <= Math.Abs(e.X - endX)) draggingStart = true; else draggingEnd = true;
-        UpdateDrag(e.X);
+        if (e.Button != MouseButtons.Left) return;
+        (draggingStart, draggingEnd, draggingRange) = HitTest(e.X);
+        rangeGrabOffset = XToValue(e.X) - StartValue;
+        UpdateEmphasis(e.X);
+        if (!draggingRange) UpdateDrag(e.X);
     }
 
     protected override void OnMouseMove(MouseEventArgs e)
     {
-        if (draggingStart || draggingEnd) UpdateDrag(e.X);
+        if (draggingStart || draggingEnd || draggingRange) UpdateDrag(e.X);
+        else UpdateEmphasis(e.X);
     }
 
     protected override void OnMouseUp(MouseEventArgs e)
     {
-        if (!draggingStart && !draggingEnd) return;
-        draggingStart = draggingEnd = false;
+        if (!draggingStart && !draggingEnd && !draggingRange) return;
+        draggingStart = draggingEnd = draggingRange = false;
+        UpdateEmphasis(ClientRectangle.Contains(e.Location) ? e.X : null);
         DragEnded?.Invoke(this, EventArgs.Empty);
     }
 
     private void UpdateDrag(int x)
     {
         var raw = Math.Round(XToValue(x), 1);
-        const decimal minGap = 0.2M;
-        if (draggingStart) StartValue = Math.Clamp(raw, Minimum, EndValue - minGap);
-        else if (draggingEnd) EndValue = Math.Clamp(raw, StartValue + minGap, Maximum);
+        if (draggingStart) StartValue = Math.Clamp(raw, Minimum, EndValue - MinGap);
+        else if (draggingEnd) EndValue = Math.Clamp(raw, StartValue + MinGap, Maximum);
+        else if (draggingRange)
+        {
+            var length = EndValue - StartValue;
+            StartValue = Math.Clamp(Math.Round(XToValue(x) - rangeGrabOffset, 1), Minimum, Maximum - length);
+            EndValue = StartValue + length;
+        }
         Invalidate();
         RangeChanged?.Invoke(this, EventArgs.Empty);
-        DragPositionChanged?.Invoke(this, draggingStart ? StartValue : EndValue);
+        DragPositionChanged?.Invoke(this, draggingEnd ? EndValue : StartValue);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -275,15 +315,23 @@ internal sealed class TrimRangeSlider : Control
         using var trackPen = new Pen(Theme.Border, Scaled(Theme.TrackThickness));
         e.Graphics.DrawLine(trackPen, radius, trackY, Width - radius, trackY);
         var startX = ValueToX(StartValue); var endX = ValueToX(EndValue);
-        using var rangePen = new Pen(Enabled ? Theme.Accent : Theme.BorderStrong, Scaled(Theme.TrackThickness));
+        // 範囲ごとずらすときは、範囲の線を太くして動かす対象を示す
+        using var rangePen = new Pen(Enabled ? Motion.Lerp(Theme.Accent, Theme.AccentHover, rangeEmphasis) : Theme.BorderStrong, Scaled(Theme.TrackThickness) * (1f + 0.75f * rangeEmphasis));
         e.Graphics.DrawLine(rangePen, startX, trackY, endX, trackY);
-        var grown = radius * (1f + 0.15f * hover); // ホバー・ドラッグ中は少し大きくする
-        DrawHandle(e.Graphics, startX, trackY, grown);
-        DrawHandle(e.Graphics, endX, trackY, grown);
+        DrawHandle(e.Graphics, startX, trackY, radius, startEmphasis);
+        DrawHandle(e.Graphics, endX, trackY, radius, endEmphasis);
     }
 
-    private void DrawHandle(Graphics g, float x, float y, float radius)
+    // 近づく・つかむほど少し大きくし、周りに薄い輪を出す
+    private void DrawHandle(Graphics g, float x, float y, float baseRadius, float emphasis)
     {
+        var radius = baseRadius * (1f + 0.25f * emphasis);
+        if (Enabled && emphasis > 0)
+        {
+            var halo = radius * 1.8f;
+            using var haloBrush = new SolidBrush(Color.FromArgb((int)(60 * emphasis), Theme.Accent));
+            g.FillEllipse(haloBrush, x - halo, y - halo, halo * 2, halo * 2);
+        }
         using var fill = new SolidBrush(Enabled ? Theme.Text : Theme.Muted);
         using var border = new Pen(Enabled ? Theme.Accent : Theme.BorderStrong, Scaled(Theme.AccentBorderWidth));
         g.FillEllipse(fill, x - radius, y - radius, radius * 2, radius * 2);
@@ -300,13 +348,16 @@ internal sealed class SeekBar : Control
     private int value;
     private bool dragging;
     private readonly FloatFader hoverFader;
-    private float hover;
+    private readonly FloatFader pressFader;
+    private float hover, press;
 
     [Browsable(false), DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public int Minimum { get; set; }
     [Browsable(false), DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
     public int Maximum { get; set; } = 300;
     public event EventHandler? Scroll; // 利用者が動かしたときだけ起きる(Valueをコードから変えても起きない)
+    public event EventHandler? DragStarted;
+    public event EventHandler? DragEnded;
 
     public SeekBar()
     {
@@ -314,6 +365,7 @@ internal sealed class SeekBar : Control
         Cursor = Cursors.Hand;
         BackColor = Color.Transparent;
         hoverFader = new FloatFader(v => { hover = v; Invalidate(); });
+        pressFader = new FloatFader(v => { press = v; Invalidate(); });
     }
 
     protected override void OnMouseEnter(EventArgs e) { hoverFader.FadeTo(1); base.OnMouseEnter(e); }
@@ -351,9 +403,22 @@ internal sealed class SeekBar : Control
         Scroll?.Invoke(this, EventArgs.Empty);
     }
 
-    protected override void OnMouseDown(MouseEventArgs e) { dragging = true; SetFromX(e.X); }
+    protected override void OnMouseDown(MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left) return;
+        dragging = true; pressFader.FadeTo(1);
+        DragStarted?.Invoke(this, EventArgs.Empty);
+        SetFromX(e.X);
+    }
+
     protected override void OnMouseMove(MouseEventArgs e) { if (dragging) SetFromX(e.X); }
-    protected override void OnMouseUp(MouseEventArgs e) { dragging = false; }
+
+    protected override void OnMouseUp(MouseEventArgs e)
+    {
+        if (!dragging) return;
+        dragging = false; pressFader.FadeTo(0);
+        DragEnded?.Invoke(this, EventArgs.Empty);
+    }
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -362,16 +427,96 @@ internal sealed class SeekBar : Control
         var radius = HandleRadius;
         var y = Height / 2f;
         var thickness = Theme.TrackThickness * DeviceDpi / 96f;
-        var handleRadius = radius * (1f + 0.15f * hover);
+        var handleRadius = radius * (1f + 0.15f * hover + 0.2f * press);
         using var trackPen = new Pen(Theme.Border, thickness);
         e.Graphics.DrawLine(trackPen, radius, y, Width - radius, y);
         var x = ValueToX();
-        using var playedPen = new Pen(Theme.BorderStrong, thickness);
+        // 再生済みの部分はアクセント色にし、どこまで進んだかを読み取りやすくする
+        using var playedPen = new Pen(Enabled ? Theme.Accent : Theme.BorderStrong, thickness);
         e.Graphics.DrawLine(playedPen, radius, y, x, y);
         using var fill = new SolidBrush(Enabled ? Theme.Text : Theme.Muted);
-        using var border = new Pen(Enabled ? Theme.Muted : Theme.BorderStrong, Theme.BorderWidth * 2 * DeviceDpi / 96f);
+        using var border = new Pen(Enabled ? Motion.Lerp(Theme.Muted, Theme.Accent, Math.Max(hover, press)) : Theme.BorderStrong, Theme.BorderWidth * 2 * DeviceDpi / 96f);
         e.Graphics.FillEllipse(fill, x - handleRadius, y - handleRadius, handleRadius * 2, handleRadius * 2);
         e.Graphics.DrawEllipse(border, x - handleRadius, y - handleRadius, handleRadius * 2, handleRadius * 2);
+    }
+}
+
+//--------------
+// PlayPauseButton
+// プレビューの再生・一時停止。三角と2本線を、縮めながら入れ替えて切り替える。
+//--------------
+internal sealed class PlayPauseButton : Control
+{
+    private readonly FloatFader hoverFader;
+    private readonly FloatFader stateFader;
+    private float hover;
+    private float state; // 0:再生の三角 1:一時停止の2本線(描画に使う、今の形)
+    private bool playing;
+
+    public PlayPauseButton()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw | ControlStyles.SupportsTransparentBackColor | ControlStyles.Selectable, true);
+        Cursor = Cursors.Hand;
+        BackColor = Color.Transparent;
+        AccessibleRole = AccessibleRole.PushButton;
+        AccessibleName = "再生";
+        hoverFader = new FloatFader(v => { hover = v; Invalidate(); });
+        stateFader = new FloatFader(v => { state = v; Invalidate(); }, Motion.DefaultMilliseconds);
+    }
+
+    [Browsable(false), DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+    public bool Playing
+    {
+        get => playing;
+        set
+        {
+            if (playing == value) return;
+            playing = value;
+            AccessibleName = value ? "一時停止" : "再生";
+            stateFader.FadeTo(value ? 1 : 0);
+        }
+    }
+
+    protected override void OnMouseEnter(EventArgs e) { hoverFader.FadeTo(1); base.OnMouseEnter(e); }
+    protected override void OnMouseLeave(EventArgs e) { hoverFader.FadeTo(0); base.OnMouseLeave(e); }
+    protected override void OnEnabledChanged(EventArgs e) { Cursor = Enabled ? Cursors.Hand : Cursors.Default; Invalidate(); base.OnEnabledChanged(e); }
+    protected override bool IsInputKey(Keys keyData) => keyData is Keys.Space or Keys.Enter || base.IsInputKey(keyData);
+    protected override void OnKeyDown(KeyEventArgs e) { if (e.KeyCode is Keys.Space or Keys.Enter) { OnClick(EventArgs.Empty); e.Handled = true; } base.OnKeyDown(e); }
+    protected override void OnGotFocus(EventArgs e) { Invalidate(); base.OnGotFocus(e); }
+    protected override void OnLostFocus(EventArgs e) { Invalidate(); base.OnLostFocus(e); }
+
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        var g = e.Graphics; g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.Clear(Parent?.BackColor ?? Theme.SurfaceElevated);
+        var zoom = DeviceDpi / 96f;
+        var circle = new RectangleF(1, 1, Width - 3, Height - 3);
+        var hot = Enabled ? hover : 0f;
+        using (var back = new SolidBrush(Enabled ? Motion.Lerp(Theme.Accent, Theme.AccentHover, hot) : Theme.SurfaceSubtle))
+            g.FillEllipse(back, circle);
+        // 枠は、キーボードで操作しているときだけ出す
+        if (Focused && ShowFocusCues)
+        {
+            using var ring = new Pen(Theme.Focus, 1.5f);
+            g.DrawEllipse(ring, circle);
+        }
+        var color = Enabled ? Theme.TextOnAccent : Theme.Muted;
+        var cx = Width / 2f; var cy = Height / 2f; var size = 6.5f * zoom;
+        // 形が入れ替わる間は、古い形を縮めてから新しい形を広げる
+        var playScale = Math.Max(0f, 1f - state * 2f);
+        var pauseScale = Math.Max(0f, state * 2f - 1f);
+        using var brush = new SolidBrush(color);
+        if (playScale > 0)
+        {
+            var s = size * playScale;
+            g.FillPolygon(brush, new[] { new PointF(cx - s * 0.75f, cy - s), new PointF(cx - s * 0.75f, cy + s), new PointF(cx + s * 1.05f, cy) });
+        }
+        if (pauseScale > 0)
+        {
+            var h = size * pauseScale; var w = 2.6f * zoom * pauseScale; var gap = 2.4f * zoom;
+            g.FillRectangle(brush, cx - gap - w, cy - h, w, h * 2);
+            g.FillRectangle(brush, cx + gap, cy - h, w, h * 2);
+        }
     }
 }
 

@@ -1,12 +1,12 @@
 //==================================================
 // AppSettings
-// 保存先・容量上限・容量制限の有無を %LOCALAPPDATA%\CompressionRecorder\settings.json へ保存する。
+// 保存先・容量上限・容量制限の有無を %LOCALAPPDATA%\uskCompressionRecorder\settings.json へ保存する。
 //==================================================
 
 using System.IO;
 using System.Text.Json;
 
-namespace CompressionRecorder;
+namespace uskCompressionRecorder;
 
 internal sealed class AppSettings
 {
@@ -18,10 +18,12 @@ internal sealed class AppSettings
     public decimal SizeLimitMb { get; set; } = DefaultSizeMb;
     public bool SizeLimitEnabled { get; set; } = true;
 
-    private static string Directory_ => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CompressionRecorder");
+    private static string Directory_ => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "uskCompressionRecorder");
     private static string FilePath => Path.Combine(Directory_, "settings.json");
-    // 旧名(Discord Clip Recorder)の設定。新しい保存先に設定がないときだけ引き継ぐ
-    private static string LegacyDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DiscordClipRecorder");
+    // 旧名の設定。新しい保存先に設定がないときだけ、新しい旧名から順に探して引き継ぐ
+    private static readonly string[] LegacyDirectories = ["CompressionRecorder", "DiscordClipRecorder"];
+    private static IEnumerable<string> LegacyPaths(string name) =>
+        LegacyDirectories.Select(directory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), directory, name));
 
     //--------------
     // Load
@@ -31,10 +33,10 @@ internal sealed class AppSettings
         var settings = new AppSettings();
         try
         {
-            var legacyFile = Path.Combine(LegacyDirectory, "settings.json");
-            if (File.Exists(FilePath) || File.Exists(legacyFile))
+            var source = File.Exists(FilePath) ? FilePath : LegacyPaths("settings.json").FirstOrDefault(File.Exists);
+            if (source is not null)
             {
-                settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(File.Exists(FilePath) ? FilePath : legacyFile)) ?? settings;
+                settings = JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(source)) ?? settings;
             }
             else
             {
@@ -46,7 +48,7 @@ internal sealed class AppSettings
         catch { }
         settings.SizeLimitMb = Math.Clamp(Math.Round(settings.SizeLimitMb, MidpointRounding.AwayFromZero), MinSizeMb, MaxSizeMb); // 容量上限は整数MB
         if (string.IsNullOrWhiteSpace(settings.SaveDirectory))
-            settings.SaveDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "Compression Recorder");
+            settings.SaveDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyVideos), "uskCompressionRecorder");
         return settings;
     }
 
@@ -68,12 +70,8 @@ internal sealed class AppSettings
     {
         try
         {
-            foreach (var directory in new[] { Directory_, LegacyDirectory })
-            {
-                var path = Path.Combine(directory, name);
-                if (File.Exists(path)) return File.ReadAllText(path).Trim();
-            }
-            return null;
+            var path = LegacyPaths(name).Prepend(Path.Combine(Directory_, name)).FirstOrDefault(File.Exists);
+            return path is null ? null : File.ReadAllText(path).Trim();
         }
         catch { return null; }
     }

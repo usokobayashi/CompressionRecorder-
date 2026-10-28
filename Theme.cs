@@ -5,7 +5,7 @@
 
 using System.Collections.Concurrent;
 
-namespace CompressionRecorder;
+namespace uskCompressionRecorder;
 
 internal static class Theme
 {

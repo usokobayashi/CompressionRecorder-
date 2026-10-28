@@ -29,7 +29,7 @@ using WpfGeometryCombineMode = System.Windows.Media.GeometryCombineMode;
 using WpfMouseButtonEventArgs = System.Windows.Input.MouseButtonEventArgs;
 using WpfMouseEventArgs = System.Windows.Input.MouseEventArgs;
 
-namespace CompressionRecorder;
+namespace uskCompressionRecorder;
 
 public sealed class MainForm : Form
 {
@@ -77,6 +77,9 @@ public sealed class MainForm : Form
     private readonly WpfRectangleShape cropRectVisual = new();
     private readonly WpfRectangleShape[] cropHandles = Enumerable.Range(0, 4).Select(_ => new WpfRectangleShape { Width = Theme.CropHandleSize, Height = Theme.CropHandleSize, IsHitTestVisible = false }).ToArray();
     private readonly SeekBar previewSeek = new();
+    private readonly PlayPauseButton playButton = new();
+    private readonly Button markInButton = new();
+    private readonly Button markOutButton = new();
     private readonly Panel editorPanel = new();
     private readonly Panel fileCard = new();
     private readonly Label fileName = new();
@@ -112,9 +115,15 @@ public sealed class MainForm : Form
     private long videoStartTicks;    // 映像が撮り始まった時刻(UTCのTicks)。0は未計測
     private bool stopping;
     private bool playing;
-    private bool scrubbing; // 切り取りのつまみを動かしている間(再生を止めて位置を見せる)
+    private bool Playing { get => playing; set { playing = value; playButton.Playing = value; } } // 再生ボタンの形も合わせる
+    private bool scrubbing; // つまみ・シークバーを動かしている間(再生を止めて位置を見せる)
     private double? pendingSeek;          // まだ映像へ反映していない、最新の再生位置の要求(秒)
     private long lastSeekAt;              // 最後に位置を動かした時刻(TickCount64)。動かした直後は映像の位置が追いつかない
+    private double lastSeekTarget;        // 最後に映像へ反映した再生位置(秒)
+    private readonly System.Windows.Forms.Timer cropTimer = new() { Interval = 15 }; // 切り取り範囲を動かして戻す
+    private Action? cropAnimationStep;
+    private ColorFader? statusFader;
+    private ColorFader? fileCardFader;
     private readonly System.Windows.Forms.Timer seekTimer = new() { Interval = 40 };
     private bool recordedWithAudio;
     private ClipFormat outputFormat = ClipFormat.Mp4;
@@ -137,12 +146,17 @@ public sealed class MainForm : Form
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowTextLength(IntPtr hWnd);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder text, int maxCount);
     [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+    [DllImport("user32.dll")] private static extern bool GetClientRect(IntPtr hWnd, out NativeRect rect);
+    [DllImport("user32.dll")] private static extern bool ClientToScreen(IntPtr hWnd, ref NativePoint point);
     [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr hWnd, int attribute, ref int value, int size);
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] private static extern int SetWindowTheme(IntPtr hWnd, string? appName, string? idList);
     private delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeRect { public int Left, Top, Right, Bottom; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativePoint { public int X, Y; }
 
     private static int EditorTop => SetupCardTop + SetupCardHeight + CardGap;
     private static int FileCardTop => EditorTop + EditorHeight + FileCardGap;
@@ -156,7 +170,7 @@ public sealed class MainForm : Form
         Opacity = 0;
         // 全体を組み立ててから表示倍率へ拡大する。途中で拡大すると後から足した部品だけ100%の位置に残る
         SuspendLayout();
-        Text = "Compression Recorder";
+        Text = "uskCompressionRecorder";
         ClientSize = new Size(BaseClientWidth, FileCardTop + FileCardHeight + FullBottomMargin);
         MinimumSize = new Size(588, 520);
         AutoScroll = true;
@@ -171,7 +185,7 @@ public sealed class MainForm : Form
         try { Icon = Icon.ExtractAssociatedIcon(Environment.ProcessPath!); } catch { }
         ConfigureHintTip();
 
-        var title = NewLabel("COMPRESSION RECORDER", Theme.FontSize.Title, FontStyle.Bold, Theme.Text);
+        var title = NewLabel("uskCompressionRecorder", Theme.FontSize.Title, FontStyle.Bold, Theme.Text);
         title.Location = new Point(30, 22); title.AutoSize = true;
         var subtitle = NewLabel($"30 FPS  •  最大 {ClipEncoder.MaxDimension}×{ClipEncoder.MaxDimension}  •  最長 {MaxSeconds}秒", Theme.FontSize.Body, FontStyle.Regular, Theme.Muted);
         subtitle.Location = new Point(32, 60); subtitle.AutoSize = true;
@@ -216,12 +230,14 @@ public sealed class MainForm : Form
         ResetEditor();
         status.Text = "●  準備完了 — F8でも録画できます"; status.Location = new Point(16, 16); status.Size = new Size(506, 28);
         status.ForeColor = Theme.Success; status.TextAlign = ContentAlignment.MiddleLeft; status.AutoEllipsis = true; status.Font = Theme.Font(Theme.FontSize.Heading, FontStyle.Bold);
+        statusFader = new ColorFader(status.ForeColor, c => status.ForeColor = c);
 
         setupCard.Controls.AddRange([status, targetLabel, captureTarget, refreshTargetsButton, audioEnabled, audioLabel, audioHint, limitEnabled, limitLabel, limitHelp, maxSize, mb, folderButton, recordButton, timerLabel]);
         Controls.AddRange([title, subtitle, setupCard, editorPanel, fileCard]);
         recordTimer.Tick += RecordTimerTick;
         previewTimer.Tick += PreviewTimerTick;
         seekTimer.Tick += (_, _) => FlushSeek(false);
+        cropTimer.Tick += (_, _) => cropAnimationStep?.Invoke();
         estimateTimer.Tick += async (_, _) => { estimateTimer.Stop(); await EstimateOutputAsync(); };
         FormClosing += OnClosing;
         Load += (_, _) => fadeGuardTimer.Start();
@@ -233,7 +249,14 @@ public sealed class MainForm : Form
             var dark = 1; DwmSetWindowAttribute(Handle, 20, ref dark, sizeof(int)); SetWindowTheme(Handle, "DarkMode_Explorer", null);
             RegisterHotKey(Handle, HotkeyId, 0, (uint)Keys.F8); RefreshCaptureTargets(false);
             SweepOldTempFiles();
-            _ = Task.Run(() => FfmpegLocator.Path); // 同梱のFFmpegを、初回だけ裏で展開しておく
+            // 同梱のFFmpegを初回だけ裏で展開し、各モニターで ddagrab が使えるかも先に確かめておく(録画の開始を待たせない)
+            var deviceNames = Screen.AllScreens.Select(screen => screen.DeviceName).ToArray();
+            _ = Task.Run(() =>
+            {
+                var ffmpeg = FfmpegLocator.Path;
+                foreach (var name in deviceNames)
+                    if (DesktopDuplication.Find(name) is { } output) _ = DesktopDuplication.IsUsableAsync(ffmpeg, output.Index);
+            });
             BeginInvoke(() => { FitWindow(); StartFadeIn(); });
         };
         // 表示倍率の違うモニターへ移すと部品が拡大・縮小されるため、窓も中身に合わせ直す
@@ -255,28 +278,40 @@ public sealed class MainForm : Form
         resolutionInfo.ForeColor = Theme.Muted; resolutionInfo.Font = Theme.Font(Theme.FontSize.Small); resolutionInfo.AutoEllipsis = true;
         previewHost.Location = new Point(0, 42); previewHost.Size = new Size(506, 285); previewHost.BackColor = Theme.Surface;
         media.LoadedBehavior = MediaState.Manual; media.UnloadedBehavior = MediaState.Manual; media.Stretch = System.Windows.Media.Stretch.Uniform;
-        media.MediaEnded += (_, _) => { if (playing && !scrubbing) { SeekTo(TrimStartSeconds, true); media.Play(); } };
+        media.MediaEnded += (_, _) => { if (Playing && !scrubbing) { SeekTo(TrimStartSeconds, true); media.Play(); } };
         BuildCropOverlay();
         cropInfo.Text = "選択範囲: フレーム全体"; cropInfo.Location = new Point(18, 331); cropInfo.Size = new Size(330, 20); cropInfo.ForeColor = Theme.Muted; cropInfo.Font = Theme.Font(Theme.FontSize.Caption); cropInfo.AutoEllipsis = true;
         cropResetButton.Text = "選択をリセット"; cropResetButton.Location = new Point(368, 327); cropResetButton.Size = new Size(120, 26); cropResetButton.Font = Theme.Font(Theme.FontSize.Caption);
-        StyleSecondary(cropResetButton); cropResetButton.Click += (_, _) => { cropFraction = new WpfRect(0, 0, 1, 1); UpdateCropVisual(); };
+        StyleSecondary(cropResetButton); cropResetButton.Click += (_, _) => AnimateCropTo(new WpfRect(0, 0, 1, 1));
         previewSeek.Location = new Point(14, 363); previewSeek.Size = new Size(478, 36); previewSeek.Minimum = 0; previewSeek.Maximum = 300;
         media.ScrubbingEnabled = true; // 一時停止中に位置を動かしても、その場の映像を表示する
         previewSeek.Scroll += SeekChanged;
-        previewTime.Text = "00:00.0 / 00:00.0"; previewTime.Location = new Point(18, 401); previewTime.Size = new Size(470, 22); previewTime.TextAlign = ContentAlignment.MiddleRight; previewTime.ForeColor = Theme.Muted;
+        previewSeek.DragStarted += (_, _) => BeginScrub();
+        previewSeek.DragEnded += (_, _) => EndScrub(null);
+        // 再生・始点と終点の設定・経過時間を、シークバーの下に1行で並べる
+        playButton.Location = new Point(18, 400); playButton.Size = new Size(26, 26);
+        playButton.Click += (_, _) => TogglePlayback();
+        markInButton.Text = "始点に設定"; markInButton.Location = new Point(54, 401); markInButton.Size = new Size(92, 24); markInButton.Font = Theme.Font(Theme.FontSize.Caption);
+        markOutButton.Text = "終点に設定"; markOutButton.Location = new Point(152, 401); markOutButton.Size = new Size(92, 24); markOutButton.Font = Theme.Font(Theme.FontSize.Caption);
+        StyleSecondary(markInButton); markInButton.Click += (_, _) => MarkIn();
+        StyleSecondary(markOutButton); markOutButton.Click += (_, _) => MarkOut();
+        var timeHelp = new HelpMark { AccessibleName = "時間の切り取りのヘルプ", Location = new Point(252, 404) };
+        hintTip.SetToolTip(timeHelp, "Space：再生／一時停止\n← →：0.1秒ずつ移動（Shift：1秒）\nI・O：今の位置を始点・終点にする\nつまみの間をドラッグ：長さを保って範囲をずらす");
+        previewTime.Text = "00:00.0 / 00:00.0"; previewTime.Location = new Point(280, 401); previewTime.Size = new Size(208, 24); previewTime.TextAlign = ContentAlignment.MiddleRight; previewTime.ForeColor = Theme.Muted;
+        previewTime.Font = Theme.MonoFont(Theme.FontSize.Small); // 数字の幅をそろえ、再生中に文字が揺れないようにする
         trimSlider.Location = new Point(18, 429); trimSlider.Size = new Size(470, 30);
         trimSlider.RangeChanged += (_, _) => { SyncSeekToTrim(); UpdateTrimInfo(); };
-        // つまみを動かしている間は一時停止してその位置を見せ、離したら切り取り範囲の頭から再生を再開する
+        // つまみを動かしている間は一時停止してその位置を見せる。離したら、再生中だったときは切り取り範囲の頭から再生を再開する
         trimSlider.DragPositionChanged += (_, value) =>
         {
-            if (!scrubbing) { scrubbing = true; media.Pause(); } // 一時停止は最初の1回だけ
+            BeginScrub();
             SeekTo((double)value, false);
             ShowTrimBubble(value);
         };
         trimSlider.DragEnded += (_, _) =>
         {
-            trimBubble.Visible = false; scrubbing = false;
-            if (clipLoaded && !exporting) { SeekTo(TrimStartSeconds, true); media.Play(); playing = true; previewTimer.Start(); }
+            trimBubble.Visible = false;
+            EndScrub(Playing ? TrimStartSeconds : null);
         };
         trimBubble.Visible = false; trimBubble.AutoSize = true; trimBubble.BackColor = Theme.Accent; trimBubble.ForeColor = Theme.TextOnAccent;
         trimBubble.Font = Theme.MonoFont(Theme.FontSize.Caption, FontStyle.Bold); trimBubble.Padding = new Padding(6, 2, 6, 2);
@@ -289,13 +324,16 @@ public sealed class MainForm : Form
         trimInfo.Location = new Point(18, 543); trimInfo.Size = new Size(470, 40); trimInfo.ForeColor = Theme.Muted; trimInfo.TextAlign = ContentAlignment.MiddleCenter;
         exportButton.Location = new Point(18, 591); exportButton.Size = new Size(470, 50);
         exportButton.FlatStyle = FlatStyle.Flat; exportButton.FlatAppearance.BorderSize = 0; exportButton.BackColor = Theme.Accent; exportButton.ForeColor = Theme.TextOnAccent; exportButton.Cursor = Cursors.Hand;
+        exportButton.Font = Theme.Font(Theme.FontSize.Heading, FontStyle.Bold); // 主な操作のため、録画ボタンと同じく太字にする
         exportButton.Click += async (_, _) => { if (exporting) CancelExport(); else if (clipLoaded) await ExportAsync(); };
         exportButton.Paint += DrawExportBusy;
         busyTimer.Tick += (_, _) => exportButton.Invalidate();
-        editorPanel.Controls.AddRange([heading, cropHelp, resolutionInfo, previewHost, cropInfo, cropResetButton, previewSeek, previewTime, trimSlider, formatLabel, formatHelp, formatSelect, trimInfo, exportButton, trimBubble]);
+        editorPanel.Controls.AddRange([heading, cropHelp, resolutionInfo, previewHost, cropInfo, cropResetButton, previewSeek, playButton, markInButton, markOutButton, timeHelp, previewTime, trimSlider, formatLabel, formatHelp, formatSelect, trimInfo, exportButton, trimBubble]);
         ApplyRoundedCorners(editorPanel, Theme.RadiusCard);
         ApplyRoundedCorners(exportButton, Theme.RadiusControl);
         ApplyRoundedCorners(cropResetButton, Theme.RadiusSmall);
+        ApplyRoundedCorners(markInButton, Theme.RadiusSmall);
+        ApplyRoundedCorners(markOutButton, Theme.RadiusSmall);
         ApplyRoundedCorners(trimBubble, Theme.RadiusTag);
         UpdateFormat();
     }
@@ -308,8 +346,21 @@ public sealed class MainForm : Form
         fileInfo.Location = new Point(18, 38); fileInfo.Size = new Size(470, 24); fileInfo.ForeColor = Theme.Text; fileInfo.AutoEllipsis = true;
         fileHint.Location = new Point(18, 66); fileHint.Size = new Size(470, 20); fileHint.ForeColor = Theme.Muted; fileHint.Font = Theme.Font(Theme.FontSize.Caption); fileHint.AutoEllipsis = true;
         fileCard.Controls.AddRange([fileName, fileInfo, fileHint]);
+        fileCardFader = new ColorFader(Theme.SurfaceElevated, c => fileCard.BackColor = c);
+        foreach (var part in new Control[] { fileCard, fileName, fileInfo, fileHint })
+        {
+            part.MouseEnter += (_, _) => UpdateFileCardHover();
+            part.MouseLeave += (_, _) => UpdateFileCardHover();
+        }
         ApplyRoundedCorners(fileCard, Theme.RadiusCard);
         ResetFileCard();
+    }
+
+    // 保存したファイルがあるときだけ、カーソルを乗せるとカードを少し明るくして、ドラッグできることを示す
+    private void UpdateFileCardHover()
+    {
+        var inside = fileCard.ClientRectangle.Contains(fileCard.PointToClient(Cursor.Position));
+        fileCardFader?.FadeTo(inside && finalPath is not null ? Theme.SurfaceSubtle : Theme.SurfaceElevated);
     }
 
     //--------------
@@ -430,8 +481,9 @@ public sealed class MainForm : Form
         restColors[button] = (back, fore);
         if (!buttonFaders.TryGetValue(button, out var faders))
         {
-            button.BackColor = back; button.ForeColor = fore;
-            buttonFaders[button] = (new ColorFader(back, c => button.BackColor = c, 140), new ColorFader(fore, c => button.ForeColor = c, 140));
+            button.BackColor = back; button.ForeColor = fore; button.FlatAppearance.MouseOverBackColor = back; button.FlatAppearance.MouseDownBackColor = back;
+            // 平らなボタンはカーソルを乗せた色をOSがすぐ描くため、乗せたとき・押したときの色も今の色に合わせる
+            buttonFaders[button] = (new ColorFader(back, c => { button.BackColor = c; button.FlatAppearance.MouseOverBackColor = c; button.FlatAppearance.MouseDownBackColor = c; }, 140), new ColorFader(fore, c => button.ForeColor = c, 140));
             button.MouseEnter += (_, _) => { hoveredButtons.Add(button); ApplyButtonColors(button); };
             button.MouseLeave += (_, _) => { hoveredButtons.Remove(button); ApplyButtonColors(button); };
             return;
@@ -452,7 +504,7 @@ public sealed class MainForm : Form
     private void ApplyExportLook()
     {
         if (exporting) return;
-        exportButton.Text = clipLoaded ? $"Discord用に保存 ({FormatName(outputFormat)})" : "録画すると、ここから保存できます";
+        exportButton.Text = clipLoaded ? $"保存 ({FormatName(outputFormat)})" : "録画すると、ここから保存できます";
         FadeButton(exportButton, clipLoaded ? Theme.Accent : Theme.SurfaceSubtle, clipLoaded ? Theme.TextOnAccent : Theme.Muted);
         exportButton.Cursor = clipLoaded ? Cursors.Hand : Cursors.Default;
     }
@@ -472,7 +524,7 @@ public sealed class MainForm : Form
     {
         if (!clipLoaded) return;
         var limit = limitEnabled.Checked ? $"{maxSize.Value:F0}MB" : "なし";
-        trimInfo.Text = $"切り取り後: {TrimEndSeconds - TrimStartSeconds:F1}秒  •  容量上限: {limit}  •  形式: {FormatName(outputFormat)}";
+        trimInfo.Text = $"範囲 {FormatTime(TrimStartSeconds)} – {FormatTime(TrimEndSeconds)}（{TrimEndSeconds - TrimStartSeconds:F1}秒）  •  容量上限 {limit}  •  {FormatName(outputFormat)}";
     }
 
     // 「現在の解像度」: 切り取り範囲・長さ・容量上限・形式を反映した、書き出し後の解像度を表示する。
@@ -559,6 +611,7 @@ public sealed class MainForm : Form
     private void CropMouseDown(object? sender, WpfMouseButtonEventArgs e)
     {
         if (!clipLoaded || exporting || videoDisplayRect.Width <= 0 || videoDisplayRect.Height <= 0) return;
+        cropTimer.Stop();
         var point = e.GetPosition(cropCanvas);
         var currentPixelRect = FractionToPixelRect(cropFraction);
         const double handleZone = 10;
@@ -619,8 +672,25 @@ public sealed class MainForm : Form
         if (cropDragMode == CropDragMode.None) return;
         cropDragMode = CropDragMode.None;
         cropCanvas.ReleaseMouseCapture();
-        if (cropFraction.Width < 0.03 || cropFraction.Height < 0.03) cropFraction = new WpfRect(0, 0, 1, 1);
+        if (cropFraction.Width < 0.03 || cropFraction.Height < 0.03) { AnimateCropTo(new WpfRect(0, 0, 1, 1)); return; }
         UpdateCropVisual();
+    }
+
+    // 範囲を目標へなめらかに動かす。途中で操作し直したら、今の範囲から動かす
+    private void AnimateCropTo(WpfRect target)
+    {
+        cropTimer.Stop();
+        if (!Motion.Enabled || cropFraction == target) { cropFraction = target; UpdateCropVisual(); return; }
+        static double Lerp(double a, double b, double t) => a + (b - a) * t;
+        var from = cropFraction; var clock = Stopwatch.StartNew();
+        cropAnimationStep = () =>
+        {
+            var t = Motion.EaseOut((float)(clock.Elapsed.TotalMilliseconds / 220));
+            cropFraction = t >= 1 ? target : new WpfRect(Lerp(from.X, target.X, t), Lerp(from.Y, target.Y, t), Lerp(from.Width, target.Width, t), Lerp(from.Height, target.Height, t));
+            UpdateCropVisual();
+            if (t >= 1) cropTimer.Stop();
+        };
+        cropTimer.Start();
     }
 
     private WpfRect FractionToPixelRect(WpfRect fraction) => new(
@@ -681,7 +751,7 @@ public sealed class MainForm : Form
     }
 
     private static Label NewLabel(string text, float size, FontStyle style, Color color) => new() { Text = text, Font = Theme.Font(size, style), ForeColor = color };
-    private static void StyleSecondary(Button b) { b.FlatStyle = FlatStyle.Flat; b.BackColor = Theme.SurfaceElevated; b.ForeColor = Theme.Text; b.Cursor = Cursors.Hand; }
+    private void StyleSecondary(Button b) { b.FlatStyle = FlatStyle.Flat; b.Cursor = Cursors.Hand; FadeButton(b, Theme.SurfaceElevated, Theme.Text); }
 
     // 角丸の半径は100%表示の値で受け取り、今の表示倍率の画素へ換算して切り抜く
     private static void ApplyRoundedCorners(Control control, int radius)
@@ -706,7 +776,18 @@ public sealed class MainForm : Form
         if (control is Button button)
         {
             button.FlatAppearance.BorderSize = 0;
-            button.Paint += (_, e) => DrawRoundedBorder(button, e.Graphics, radius, BorderFor(button.BackColor));
+            button.Paint += (_, e) =>
+            {
+                // 押せないとき、OSは文字を暗い灰色で描き、暗い面の上では読めない。面の色で塗り直し、淡い文字で描き直す
+                if (!button.Enabled)
+                {
+                    using var back = new SolidBrush(button.BackColor);
+                    e.Graphics.FillRectangle(back, button.ClientRectangle);
+                    TextRenderer.DrawText(e.Graphics, button.Text, button.Font, button.ClientRectangle, Theme.Muted,
+                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+                }
+                DrawRoundedBorder(button, e.Graphics, radius, BorderFor(button.BackColor));
+            };
         }
     }
 
@@ -749,7 +830,7 @@ public sealed class MainForm : Form
         recordButton.Invalidate();
     }
 
-    private void SetStatus(string text, Color color) { status.ForeColor = color; status.Text = text; }
+    private void SetStatus(string text, Color color) { status.Text = text; if (statusFader is null) status.ForeColor = color; else statusFader.FadeTo(color); }
 
     private static string TimerText(int seconds) => $"{seconds / 60:00}:{seconds % 60:00} / {MaxSeconds / 60:00}:{MaxSeconds % 60:00}";
 
@@ -765,7 +846,7 @@ public sealed class MainForm : Form
         {
             var screen = screens[i];
             var primary = screen.Primary ? "・メイン" : string.Empty;
-            targets.Add(CaptureSource.ForMonitor($"モニター {i + 1}{primary}  {screen.Bounds.Width}×{screen.Bounds.Height}", screen.Bounds));
+            targets.Add(CaptureSource.ForMonitor($"モニター {i + 1}{primary}  {screen.Bounds.Width}×{screen.Bounds.Height}", screen.Bounds, screen.DeviceName));
         }
 
         var windows = new List<CaptureSource>();
@@ -795,10 +876,40 @@ public sealed class MainForm : Form
     {
         int width, height;
         if (target.Kind == CaptureKind.Monitor) { width = target.Bounds.Width; height = target.Bounds.Height; }
-        else if (GetWindowRect(target.WindowHandle, out var rect)) { width = rect.Right - rect.Left; height = rect.Bottom - rect.Top; }
-        else return (0, 0);
+        else { var client = WindowClientBounds(target.WindowHandle); width = client.Width; height = client.Height; }
+        if (width <= 0 || height <= 0) return (0, 0);
         var shrink = Math.Min(1.0, Math.Min(ClipEncoder.MaxDimension / (double)width, ClipEncoder.MaxDimension / (double)height));
         return ((int)(width * shrink) / 2 * 2, (int)(height * shrink) / 2 * 2);
+    }
+
+    // ウィンドウの中身(タイトルバー・枠を除く)の、画面上の範囲(画素)。gdigrab のウィンドウ録画と同じ範囲
+    private static Rectangle WindowClientBounds(IntPtr hWnd)
+    {
+        if (!GetClientRect(hWnd, out var client)) return Rectangle.Empty;
+        var origin = new NativePoint();
+        if (!ClientToScreen(hWnd, ref origin)) return Rectangle.Empty;
+        return new Rectangle(origin.X, origin.Y, client.Right - client.Left, client.Bottom - client.Top);
+    }
+
+    // 録画の入力。ddagrab(Desktop Duplication)が使えるときはそれを使う。gdigrab は取り込むたびに画面上のカーソルがちらつき、
+    // 表示倍率によってはカーソルをずれた位置に描くため。別のGPUにつながるモニター・複数のモニターにまたがるウィンドウなどは gdigrab で録る
+    private async Task<(string Input, string Download)> CaptureInputAsync(CaptureSource target)
+    {
+        var region = target.Kind == CaptureKind.Monitor ? target.Bounds : WindowClientBounds(target.WindowHandle);
+        var deviceName = target.Kind == CaptureKind.Monitor ? target.DeviceName : Screen.FromHandle(target.WindowHandle).DeviceName;
+        if (region.Width >= 2 && region.Height >= 2 && deviceName is not null
+            && DesktopDuplication.Find(deviceName) is { } output && output.Bounds.Contains(region)
+            && (region == output.Bounds || output.Unrotate.Length == 0) // 回転したモニターの一部は、撮る範囲の座標が回転前になるため gdigrab で録る
+            && await DesktopDuplication.IsUsableAsync(FfmpegPath, output.Index))
+        {
+            var area = region == output.Bounds ? string.Empty
+                : $":video_size={region.Width}x{region.Height}:offset_x={region.X - output.Bounds.X}:offset_y={region.Y - output.Bounds.Y}";
+            return ($"-f lavfi -i ddagrab=output_idx={output.Index}:framerate=30:draw_mouse=1{area}", "hwdownload,format=bgra," + output.Unrotate);
+        }
+        var gdi = target.Kind == CaptureKind.Monitor
+            ? $"-offset_x {target.Bounds.X} -offset_y {target.Bounds.Y} -video_size {target.Bounds.Width}x{target.Bounds.Height} -i desktop"
+            : $"-i hwnd=0x{target.WindowHandle.ToInt64():X}";
+        return ($"-f gdigrab -framerate 30 {gdi}", string.Empty);
     }
 
     //--------------
@@ -808,7 +919,7 @@ public sealed class MainForm : Form
 
     private void StartDesktopAudio()
     {
-        audioTempPath = Path.Combine(Path.GetTempPath(), $"discord-audio-{Guid.NewGuid():N}.wav");
+        audioTempPath = Path.Combine(Path.GetTempPath(), $"usk-audio-{Guid.NewGuid():N}.wav");
         loopbackCapture = new WasapiLoopbackCapture();
         loopbackWriter = new WaveFileWriter(audioTempPath, loopbackCapture.WaveFormat);
         loopbackStopped = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -848,7 +959,7 @@ public sealed class MainForm : Form
     {
         if (tempPath is null || audioTempPath is null || !File.Exists(audioTempPath) || new FileInfo(audioTempPath).Length <= 44)
             throw new InvalidOperationException("デスクトップ音声を取得できませんでした。Windowsの再生デバイスを確認してください。");
-        var combined = Path.Combine(Path.GetTempPath(), $"discord-preview-{Guid.NewGuid():N}.mp4");
+        var combined = Path.Combine(Path.GetTempPath(), $"usk-preview-{Guid.NewGuid():N}.mp4");
         // 音声はffmpegの起動を待たずに始まるため、映像が撮り始まるまでの分だけ音声の頭を切って映像にそろえる
         var videoStart = Interlocked.Read(ref videoStartTicks);
         var audioOffset = videoStart > 0 ? Math.Clamp((new DateTime(videoStart, DateTimeKind.Utc) - audioStartedAt).TotalSeconds, 0, 5) : 0;
@@ -875,7 +986,7 @@ public sealed class MainForm : Form
         if (captureTarget.SelectedItem is not CaptureSource target)
         {
             RefreshCaptureTargets(false);
-            target = captureTarget.SelectedItem as CaptureSource ?? CaptureSource.ForMonitor("メインモニター", Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1280, 720));
+            target = captureTarget.SelectedItem as CaptureSource ?? CaptureSource.ForMonitor("メインモニター", Screen.PrimaryScreen?.Bounds ?? new Rectangle(0, 0, 1280, 720), Screen.PrimaryScreen?.DeviceName);
         }
         if (target.Kind == CaptureKind.Window && !IsWindow(target.WindowHandle))
         {
@@ -889,7 +1000,7 @@ public sealed class MainForm : Form
         recordedWithAudio = useAudio;
         ReleaseOnTop();
         recordedSeconds = 0; Interlocked.Exchange(ref videoStartTicks, 0);
-        tempPath = Path.Combine(Path.GetTempPath(), $"discord-clip-{Guid.NewGuid():N}.mp4");
+        tempPath = Path.Combine(Path.GetTempPath(), $"usk-clip-{Guid.NewGuid():N}.mp4");
         finalPath = null;
         RunBulkUpdate(() =>
         {
@@ -897,12 +1008,10 @@ public sealed class MainForm : Form
             SetStatus("●  準備完了 — F8でも録画できます", Theme.Success);
             AutoScrollPosition = Point.Empty;
         });
-        var input = target.Kind == CaptureKind.Monitor
-            ? $"-offset_x {target.Bounds.X} -offset_y {target.Bounds.Y} -video_size {target.Bounds.Width}x{target.Bounds.Height} -i desktop"
-            : $"-i hwnd=0x{target.WindowHandle.ToInt64():X}";
+        var (input, download) = await CaptureInputAsync(target);
         var cap = ClipEncoder.MaxDimension;
         // -t は録画の長さの上限。ffmpegが映像を撮り始めてからMaxSeconds秒で自分で止まる(起動の待ち時間ぶん短くならない)
-        var args = $"-hide_banner -loglevel error -nostats -progress pipe:1 -f gdigrab -framerate 30 {input} -map 0:v:0 -vf \"scale='min({cap},iw)':'min({cap},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos\" -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p -an -t {MaxSeconds} -y \"{tempPath}\"";
+        var args = $"-hide_banner -loglevel error -nostats -progress pipe:1 {input} -map 0:v:0 -vf \"{download}scale='min({cap},iw)':'min({cap},ih)':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=lanczos\" -c:v libx264 -preset ultrafast -crf 18 -pix_fmt yuv420p -an -t {MaxSeconds} -y \"{tempPath}\"";
         try
         {
             if (useAudio) StartDesktopAudio();
@@ -976,10 +1085,10 @@ public sealed class MainForm : Form
         var end = Math.Max(0.5M, (decimal)Math.Floor(recordedDuration * 10) / 10M);
         trimSlider.SetRange(0, end, 0, end); trimBubble.Visible = false;
         SyncSeekToTrim(); previewSeek.Value = previewSeek.Minimum;
-        cropFraction = new WpfRect(0, 0, 1, 1); cropDragMode = CropDragMode.None; UpdateCropVisual();
+        cropTimer.Stop(); cropFraction = new WpfRect(0, 0, 1, 1); cropDragMode = CropDragMode.None; UpdateCropVisual();
         resolutionInfo.Text = "現在の解像度  読み込み中…";
         clipLoaded = true; SetEditorReady(true);
-        media.Source = new Uri(tempPath!); media.Position = TimeSpan.Zero; media.Play(); playing = true; previewTimer.Start();
+        media.Source = new Uri(tempPath!); media.Position = TimeSpan.Zero; ResumePlayback();
         previewTime.Text = $"00:00.0 / {FormatTime(TrimEndSeconds - TrimStartSeconds)}";
         UpdateTrimInfo();
         BringToFrontSafely();
@@ -990,9 +1099,9 @@ public sealed class MainForm : Form
     // 録画前・録画中の編集画面。並びは変えず、中身を空にして操作できないようにする
     private void ResetEditor()
     {
-        clipLoaded = false; playing = false; previewTimer.Stop();
+        clipLoaded = false; Playing = false; scrubbing = false; previewTimer.Stop();
         estimateCancellation?.Cancel(); estimateTimer.Stop();
-        cropFraction = new WpfRect(0, 0, 1, 1); cropDragMode = CropDragMode.None; UpdateCropVisual();
+        cropTimer.Stop(); cropFraction = new WpfRect(0, 0, 1, 1); cropDragMode = CropDragMode.None; UpdateCropVisual();
         trimSlider.SetRange(0, 0.1M, 0, 0.1M); trimBubble.Visible = false;
         previewSeek.Minimum = 0; previewSeek.Maximum = 5; previewSeek.Value = 0;
         previewTime.Text = "00:00.0 / 00:00.0";
@@ -1006,6 +1115,7 @@ public sealed class MainForm : Form
     private void SetEditorReady(bool ready)
     {
         trimSlider.Enabled = previewSeek.Enabled = cropResetButton.Enabled = ready;
+        playButton.Enabled = markInButton.Enabled = markOutButton.Enabled = ready;
         ApplyExportLook();
         ShowPreviewPlaceholder(!ready);
     }
@@ -1030,8 +1140,9 @@ public sealed class MainForm : Form
         finalPath = null;
         fileName.Text = "保存したファイルがここに表示されます"; fileName.ForeColor = Theme.Muted;
         fileInfo.Text = string.Empty;
-        fileHint.Text = "保存すると、このカードをDiscordの投稿欄へドラッグして添付できます";
+        fileHint.Text = "保存すると、このカードを Discord などの投稿欄へドラッグして添付できます";
         fileCard.Cursor = Cursors.Default;
+        fileCardFader?.FadeTo(Theme.SurfaceElevated);
     }
 
     // 読み込めた映像の実際の大きさと長さを表示・反映する
@@ -1062,16 +1173,82 @@ public sealed class MainForm : Form
     {
         if (pendingSeek is not double target) { seekTimer.Stop(); return; }
         if (!force && Environment.TickCount64 - lastSeekAt < 70) return;
-        pendingSeek = null; lastSeekAt = Environment.TickCount64;
+        pendingSeek = null; lastSeekAt = Environment.TickCount64; lastSeekTarget = target;
         media.Position = TimeSpan.FromSeconds(target);
         if (pendingSeek is null) seekTimer.Stop();
     }
 
     private bool SeekSettled => pendingSeek is null && Environment.TickCount64 - lastSeekAt > 450;
 
+    // 今の再生位置。動かした直後は映像の位置が追いつかないため、動かした先を使う
+    private double CurrentPosition => pendingSeek ?? (SeekSettled ? media.Position.TotalSeconds : lastSeekTarget);
+
+    //--------------
+    // 再生・一時停止・コマ送り
+    //--------------
+    private void ResumePlayback() { media.Play(); Playing = true; previewTimer.Start(); }
+
+    private void TogglePlayback()
+    {
+        if (!clipLoaded || exporting) return;
+        if (Playing) { media.Pause(); Playing = false; return; }
+        // 範囲の終わりで止めていたときは、頭から再生する
+        var position = CurrentPosition;
+        if (position >= TrimEndSeconds - 0.05 || position < TrimStartSeconds) SeekTo(TrimStartSeconds, true);
+        ResumePlayback();
+    }
+
+    // つまみ・シークバーを動かしている間は一時停止してその位置を見せ、離したら止める前の状態へ戻す
+    private void BeginScrub()
+    {
+        if (scrubbing) return;
+        scrubbing = true; media.Pause();
+    }
+
+    private void EndScrub(double? restartAt)
+    {
+        if (!scrubbing) return;
+        scrubbing = false;
+        if (!clipLoaded || exporting) return;
+        if (restartAt is double at) SeekTo(at, true);
+        if (Playing) ResumePlayback();
+    }
+
+    private void StepFrame(double seconds)
+    {
+        if (Playing) { media.Pause(); Playing = false; }
+        var position = Math.Clamp(CurrentPosition + seconds, TrimStartSeconds, TrimEndSeconds);
+        SeekTo(position, true);
+        previewSeek.Value = Math.Clamp((int)Math.Round(position * 10), previewSeek.Minimum, previewSeek.Maximum);
+        ShowPreviewTime(position);
+    }
+
+    private void MarkIn() { if (clipLoaded && !exporting) trimSlider.SetStart((decimal)CurrentPosition); }
+    private void MarkOut() { if (clipLoaded && !exporting) trimSlider.SetEnd((decimal)CurrentPosition); }
+
+    // 編集のキー操作。文字の入力中と、矢印キーを自分で使う部品の操作中は、その部品へそのまま渡す
+    protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+    {
+        if (clipLoaded && !exporting && !scrubbing && ActiveControl is not TextBoxBase)
+        {
+            var arrowsFree = ActiveControl is not (SegmentedSelect or DropdownSelect or DecimalInput);
+            switch (keyData)
+            {
+                case Keys.Space: TogglePlayback(); return true;
+                case Keys.I: MarkIn(); return true;
+                case Keys.O: MarkOut(); return true;
+                case Keys.Left when arrowsFree: StepFrame(-0.1); return true;
+                case Keys.Right when arrowsFree: StepFrame(0.1); return true;
+                case Keys.Shift | Keys.Left when arrowsFree: StepFrame(-1); return true;
+                case Keys.Shift | Keys.Right when arrowsFree: StepFrame(1); return true;
+            }
+        }
+        return base.ProcessCmdKey(ref msg, keyData);
+    }
+
     private void PreviewTimerTick(object? sender, EventArgs e)
     {
-        if (!playing || scrubbing) return;
+        if (!Playing || scrubbing) return;
         var position = media.Position.TotalSeconds;
         if (SeekSettled && (position >= TrimEndSeconds - 0.03 || position < TrimStartSeconds - 0.3))
         {
@@ -1089,7 +1266,6 @@ public sealed class MainForm : Form
     {
         var position = Math.Clamp(previewSeek.Value / 10d, TrimStartSeconds, TrimEndSeconds);
         SeekTo(position, false);
-        if (!playing) { media.Play(); playing = true; previewTimer.Start(); }
         ShowPreviewTime(position);
     }
 
@@ -1115,12 +1291,14 @@ public sealed class MainForm : Form
         limitEnabled.Enabled = !busy; maxSize.Enabled = !busy && limitEnabled.Checked;
         formatSelect.Enabled = !busy;
         trimSlider.Enabled = previewSeek.Enabled = cropResetButton.Enabled = !busy && clipLoaded;
+        playButton.Enabled = markInButton.Enabled = markOutButton.Enabled = !busy && clipLoaded;
     }
 
     private async Task ExportAsync()
     {
         if (tempPath is null || !File.Exists(tempPath)) return;
-        playing = false; previewTimer.Stop(); media.Stop(); SetExportBusy(true);
+        var resumeAfterExport = Playing;
+        Playing = false; previewTimer.Stop(); media.Stop(); SetExportBusy(true);
         exporting = true; estimateCancellation?.Cancel(); estimateTimer.Stop();
         var compressing = limitEnabled.Checked;
         exportButton.Text = compressing ? "圧縮中…  クリックで中止" : "書き出し中…  クリックで中止";
@@ -1133,7 +1311,7 @@ public sealed class MainForm : Form
         try
         {
             Directory.CreateDirectory(settings.SaveDirectory!);
-            finalPath = Path.Combine(settings.SaveDirectory!, $"DiscordClip_{DateTime.Now:yyyy-MM-dd_HH-mm-ss}.{FormatExtension(outputFormat)}");
+            finalPath = NextOutputPath(settings.SaveDirectory!, FormatExtension(outputFormat));
             var limit = CurrentLimit;
             var encoder = new ClipEncoder(FfmpegPath, text => { SetStatus(text, Theme.Muted); trimInfo.Text = text; });
             var result = await encoder.EncodeAsync(new ClipRequest
@@ -1157,8 +1335,17 @@ public sealed class MainForm : Form
             SetExportBusy(false);
             ApplyExportLook(); exportButton.Invalidate();
             UpdateTrimText(); // 保存後の「現在の解像度」は実際の値のまま残す
-            if (tempPath is not null) { SeekTo(TrimStartSeconds, true); media.Play(); playing = true; previewTimer.Start(); }
+            if (tempPath is not null) { SeekTo(TrimStartSeconds, true); if (resumeAfterExport) ResumePlayback(); else media.Pause(); }
         }
+    }
+
+    // 出力名は保存した日付と時刻(年月日時。例 2026102810.mp4)。同じ時間内に2つ目以降を保存したときは _2, _3 … を付け、上書きしない
+    private static string NextOutputPath(string directory, string extension)
+    {
+        var stem = DateTime.Now.ToString("yyyyMMddHH", CultureInfo.InvariantCulture);
+        var path = Path.Combine(directory, $"{stem}.{extension}");
+        for (var number = 2; File.Exists(path); number++) path = Path.Combine(directory, $"{stem}_{number}.{extension}");
+        return path;
     }
 
     // 圧縮中にもう一度押すと、実行中のffmpegを止めて書き出しをやめる
@@ -1213,7 +1400,7 @@ public sealed class MainForm : Form
         var fps = result.Fps > 0 ? $"  •  {result.Fps:0.#}fps" : string.Empty;
         fileInfo.Text = $"{result.Bytes / 1024d / 1024d:F2} MB{fill}  •  {result.Width}×{result.Height}{fps}";
         resolutionInfo.Text = $"現在の解像度  {result.Width}×{result.Height}{fps}";
-        fileHint.Text = "このカードをDiscordの投稿欄へドラッグして添付";
+        fileHint.Text = "このカードを Discord などの投稿欄へドラッグして添付";
         ScrollControlIntoView(fileCard);
         SetStatus("●  保存完了", Theme.Success);
     }
@@ -1231,7 +1418,7 @@ public sealed class MainForm : Form
 
     private void CleanupTemp()
     {
-        previewTimer.Stop(); playing = false; media.Stop(); media.Source = null;
+        previewTimer.Stop(); Playing = false; media.Stop(); media.Source = null;
         estimateCancellation?.Cancel(); estimateTimer.Stop();
         try { loopbackCapture?.StopRecording(); } catch { }
         try { loopbackCapture?.Dispose(); } catch { }
@@ -1246,7 +1433,7 @@ public sealed class MainForm : Form
     {
         try
         {
-            foreach (var pattern in new[] { "discord-clip-*.mp4", "discord-preview-*.mp4", "discord-audio-*.wav", "dcr-*" })
+            foreach (var pattern in new[] { "usk-clip-*.mp4", "usk-preview-*.mp4", "usk-audio-*.wav", "discord-clip-*.mp4", "discord-preview-*.mp4", "discord-audio-*.wav", "dcr-*" })
                 foreach (var file in Directory.EnumerateFiles(Path.GetTempPath(), pattern))
                     try { if (DateTime.UtcNow - File.GetLastWriteTimeUtc(file) > TimeSpan.FromHours(1)) File.Delete(file); } catch { }
         }
@@ -1278,8 +1465,9 @@ public sealed class MainForm : Form
         public required string Key { get; init; }
         public required CaptureKind Kind { get; init; }
         public Rectangle Bounds { get; init; }
+        public string? DeviceName { get; init; } // モニターの名前(\\.\DISPLAY1 など)
         public IntPtr WindowHandle { get; init; }
-        public static CaptureSource ForMonitor(string displayName, Rectangle bounds) => new() { DisplayName = displayName, Key = $"monitor:{bounds.X}:{bounds.Y}:{bounds.Width}:{bounds.Height}", Kind = CaptureKind.Monitor, Bounds = bounds };
+        public static CaptureSource ForMonitor(string displayName, Rectangle bounds, string? deviceName) => new() { DisplayName = displayName, Key = $"monitor:{bounds.X}:{bounds.Y}:{bounds.Width}:{bounds.Height}", Kind = CaptureKind.Monitor, Bounds = bounds, DeviceName = deviceName };
         public static CaptureSource ForWindow(string displayName, IntPtr handle) => new() { DisplayName = displayName, Key = $"window:{handle}", Kind = CaptureKind.Window, WindowHandle = handle };
         public override string ToString() => DisplayName;
     }

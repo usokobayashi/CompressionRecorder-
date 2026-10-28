@@ -1,4 +1,4 @@
-Compression Recorder - Third-Party Notices
+uskCompressionRecorder - Third-Party Notices
 
 NAudio 2.3.0
 Copyright (c) Mark Heath and contributors

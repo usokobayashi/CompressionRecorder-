@@ -9,7 +9,7 @@ using System.Globalization;
 using System.IO;
 using System.Text.RegularExpressions;
 
-namespace CompressionRecorder;
+namespace uskCompressionRecorder;
 
 internal enum ClipFormat { Mp4, Gif, Webp }
 

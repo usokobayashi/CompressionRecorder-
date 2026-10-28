@@ -1,7 +1,7 @@
 //==================================================
 // FfmpegLocator
 // exe単体で動くよう、FFmpegをexeの中(圧縮した埋め込みリソース)に同梱している。
-// 初回の起動で %LOCALAPPDATA%\CompressionRecorder\ffmpeg\ へ展開し、2回目以降はそれを使う。
+// 初回の起動で %LOCALAPPDATA%\uskCompressionRecorder\ffmpeg\ へ展開し、2回目以降はそれを使う。
 // exeの隣の tools\ffmpeg.exe があればそちらを優先する(開発用)。
 //==================================================
 
@@ -9,7 +9,7 @@ using System.IO;
 using System.IO.Compression;
 using System.Reflection;
 
-namespace CompressionRecorder;
+namespace uskCompressionRecorder;
 
 internal static class FfmpegLocator
 {
@@ -29,7 +29,7 @@ internal static class FfmpegLocator
             if (resource is null) return "ffmpeg.exe"; // 同梱がないビルドはPATH上のffmpegを使う
 
             // 展開先はリソースの大きさで分け、FFmpegを入れ替えた版が古いものと混ざらないようにする
-            var directory = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "CompressionRecorder", "ffmpeg", resource.Length.ToString());
+            var directory = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "uskCompressionRecorder", "ffmpeg", resource.Length.ToString());
             var target = System.IO.Path.Combine(directory, "ffmpeg.exe");
             if (File.Exists(target)) return target;
 

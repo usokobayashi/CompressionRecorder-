@@ -8,9 +8,9 @@
     <Nullable>enable</Nullable>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
-    <AssemblyName>CompressionRecorder</AssemblyName>
-    <Product>Compression Recorder</Product>
-    <Version>2.0.1</Version>
+    <AssemblyName>uskCompressionRecorder</AssemblyName>
+    <Product>uskCompressionRecorder</Product>
+    <Version>2.1.1</Version>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
